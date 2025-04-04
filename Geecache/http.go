@@ -3,12 +3,16 @@ package geecache
 import (
 	"fmt"
 	"geecache/consistenthash"
+	pb "geecache/proto"
+	"google.golang.org/protobuf/proto"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/gin-gonic/gin"
 )
 
 //提供被其他节点访问的HTTP接口
@@ -101,10 +105,51 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	body, err := proto.Marshal(&pb.Response{Value: view.ByteSlice()})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	//通常用于下载文件，尤其是当服务器无法确定文件的具体类型时，
 	//或者当客户端需要将响应内容作为文件下载时。
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Write(view.ByteSlice()) //返回缓存值
+	w.Write(body) //返回缓存值
+}
+
+// 定义 Gin 版本的处理函数
+func (p *HTTPPool) GinHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 1. 路径格式校验（由 Gin 路由确保，无需手动检查前缀）
+		// 例如路由定义为 "/_geecache/:group/:key"
+
+		// 2. 提取 group 和 key
+		groupName := c.Param("group")
+		key := c.Param("key")
+
+		// 3. 判断组是否存在
+		group := GetGroup(groupName)
+		if group == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("group %s not found", groupName)})
+			return
+		}
+
+		// 4. 获取缓存值
+		view, err := group.Get(key)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		body, err := proto.Marshal(&pb.Response{Value: view.ByteSlice()})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		// 5. 返回二进制数据
+		c.Data(http.StatusOK, "application/octet-stream", body)
+	}
 }
 
 // 客户端，实现了PeerGetter接口
@@ -114,30 +159,32 @@ type httpGetter struct {
 }
 
 // 通过http请求从远程服务器获取数据
-func (h *httpGetter) Get(group string, key string) ([]byte, error) {
+func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	u := fmt.Sprintf(
 		"%v%v/%v",
 		h.baseURL,
-		url.QueryEscape(group), //确保特殊字符被正确编码，以避免 URL 格式错误
-		url.QueryEscape(key),
+		url.QueryEscape(in.GetGroup()), //确保特殊字符被正确编码，以避免 URL 格式错误
+		url.QueryEscape(in.GetKey()),
 	)
 	//发送get请求
 	res, err := http.Get(u)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer res.Body.Close() //养成好习惯，及时关闭连接
 
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned: %v", res.Status)
+		return fmt.Errorf("server returned: %v", res.Status)
 	}
 
 	bytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response body: %v", err)
+		return fmt.Errorf("reading response body: %v", err)
 	}
-
-	return bytes, nil
+	if err := proto.Unmarshal(bytes, out); err != nil {
+		return fmt.Errorf("unmarshaling response body: %v", err)
+	}
+	return nil
 }
 
 // 显式检查，它是在编译时检查 httpGetter 类型是否实现了 PeerGetter 接口。

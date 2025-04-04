@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"geecache"
+	"github.com/gin-gonic/gin"
 	"log"
 	"net/http"
 )
@@ -33,6 +34,25 @@ func startCacheServer(addr string, addrs []string, gee *geecache.Group) {
 	gee.RegisterPeers(peers)
 	log.Println("geecache is running at", addr)
 	log.Fatal(http.ListenAndServe(addr[7:], peers))
+}
+
+func startGinCacheServer(addr string, addrs []string, gee *geecache.Group) {
+	peers := geecache.NewHTTPPool(addr)
+	peers.Set(addrs...)
+	gee.RegisterPeers(peers)
+
+	// 创建 Gin 实例
+	router := gin.Default()
+
+	// 定义路由（路径参数匹配）
+	router.GET("/_geecache/:group/:key", peers.GinHandler())
+
+	log.Println("geecache is running at", addr)
+
+	// 注意：addr[7:] 去掉 "http://" 前缀，如 "localhost:8001"
+	if err := router.Run(addr[7:]); err != nil {
+		log.Fatal("Failed to start Gin server:", err)
+	}
 }
 
 // 运行一个api即可

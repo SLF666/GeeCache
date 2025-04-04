@@ -5,6 +5,8 @@ package geecache
 
 import (
 	"fmt"
+	pb "geecache/proto"
+	"geecache/singleflight"
 	"log"
 	"sync"
 )
@@ -32,6 +34,8 @@ type Group struct {
 	mainCache cache
 
 	peers PeerPicker //节点选择器
+
+	loader *singleflight.Group
 }
 
 var (
@@ -51,6 +55,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		name:      name,
 		getter:    getter,
 		mainCache: cache{cacheBytes: cacheBytes},
+		loader:    &singleflight.Group{},
 	}
 	groups[name] = g
 	return g
@@ -82,18 +87,25 @@ func (g *Group) Get(key string) (ByteView, error) {
 
 // 下载数据
 func (g *Group) load(key string) (ByteView, error) {
-	if g.peers != nil {
-		//根据key选择节点
-		if peer, ok := g.peers.PickPeer(key); ok {
-			value, err := g.getFromPeer(peer, key)
-			if err == nil {
-				return value, nil
+	viewi, err := g.loader.Do(key, func() (interface{}, error) {
+		if g.peers != nil {
+			//根据key选择节点
+			if peer, ok := g.peers.PickPeer(key); ok {
+				value, err := g.getFromPeer(peer, key)
+				if err == nil {
+					return value, nil
+				}
+				log.Println("[GeeCache] Failed to get from peer", err)
 			}
-			log.Println("[GeeCache] Failed to get from peer", err)
 		}
+		//如果是自己负责的就调用本地下载
+		return g.getLocally(key)
+	})
+
+	if err == nil {
+		return viewi.(ByteView), nil
 	}
-	//如果是自己负责的就调用本地下载
-	return g.getLocally(key)
+	return ByteView{}, err
 }
 
 // 调用回调函数获取数据，并将数据保存到本地缓存中
@@ -124,9 +136,19 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 
 // 从远程节点获取数据
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
-	bytes, err := peer.Get(g.name, key)
+	//bytes, err := peer.Get(g.name, key)
+	//if err != nil {
+	//	return ByteView{}, err
+	//}
+	//return ByteView{b: bytes}, nil
+	req := &pb.Request{
+		Group: g.name,
+		Key:   key,
+	}
+	res := &pb.Response{}
+	err := peer.Get(req, res)
 	if err != nil {
 		return ByteView{}, err
 	}
-	return ByteView{b: bytes}, nil
+	return ByteView{b: cloneBytes(res.Value)}, nil
 }
